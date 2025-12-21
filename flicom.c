@@ -542,10 +542,26 @@ void calibrate_sensors() {
   float alt_sum = 0;
   int valid_samples = 0;
   
+  Serial.println("Reading sensors...");
+  
   for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
     float ax, ay, az;
     mpu_read_accel(&ax, &ay, &az);
     float alt = bmp_read_altitude();
+    
+    // Debug first few samples
+    if (i < 5) {
+      Serial.print("Sample ");
+      Serial.print(i);
+      Serial.print(": ax=");
+      Serial.print(ax, 3);
+      Serial.print(" ay=");
+      Serial.print(ay, 3);
+      Serial.print(" az=");
+      Serial.print(az, 3);
+      Serial.print(" alt=");
+      Serial.println(alt, 2);
+    }
     
     if (alt > -900.0) {
       ax_sum += ax;
@@ -557,13 +573,17 @@ void calibrate_sensors() {
     
     delay(10);
     
-    if (i % 20 == 0) {
+    if (i % 20 == 0 && i >= 5) {
       Serial.print(".");
     }
   }
   Serial.println();
   
   if (valid_samples < CALIBRATION_SAMPLES * 0.8) {
+    Serial.print("Valid samples: ");
+    Serial.print(valid_samples);
+    Serial.print(" / ");
+    Serial.println(CALIBRATION_SAMPLES);
     enter_error_state("Calibration failed - insufficient valid samples");
     return;
   }
@@ -574,10 +594,24 @@ void calibrate_sensors() {
   data.accel_z_bias = az_sum / valid_samples;
   flight.ground_altitude = alt_sum / valid_samples;
   
+  Serial.print("Accel averages: X=");
+  Serial.print(data.accel_x_bias, 3);
+  Serial.print(" Y=");
+  Serial.print(data.accel_y_bias, 3);
+  Serial.print(" Z=");
+  Serial.println(data.accel_z_bias, 3);
+  
   // Determine vertical axis (which axis is closest to ±1g)
-  float ax_abs = fabs(data.accel_x_bias);
-  float ay_abs = fabs(data.accel_y_bias);
-  float az_abs = fabs(data.accel_z_bias);
+  float ax_abs = fabsf(data.accel_x_bias);
+  float ay_abs = fabsf(data.accel_y_bias);
+  float az_abs = fabsf(data.accel_z_bias);
+  
+  Serial.print("Absolute values: X=");
+  Serial.print(ax_abs, 3);
+  Serial.print(" Y=");
+  Serial.print(ay_abs, 3);
+  Serial.print(" Z=");
+  Serial.println(az_abs, 3);
   
   if (ax_abs > ay_abs && ax_abs > az_abs) {
     data.vertical_axis = 0;
@@ -593,19 +627,32 @@ void calibrate_sensors() {
     data.gravity_magnitude = az_abs;
   }
   
-  // Validate
+  Serial.print("Detected gravity magnitude: ");
+  Serial.println(data.gravity_magnitude, 3);
+  
+  // Validate - relaxed for ground testing
+  #if GROUND_TEST_MODE
+  if (data.gravity_magnitude < 0.5 || data.gravity_magnitude > 1.5) {
+    Serial.println("⚠️  Warning: Unusual gravity reading, but continuing in test mode");
+    Serial.println("    (This would fail in flight mode)");
+    // Continue anyway in test mode
+  }
+  #else
   if (data.gravity_magnitude < 0.8 || data.gravity_magnitude > 1.2) {
+    Serial.print("ERROR: Gravity out of range: ");
+    Serial.println(data.gravity_magnitude, 3);
     enter_error_state("Calibration failed - invalid gravity reading");
     return;
   }
+  #endif
   
   // Initialize filters
   data.altitude_filt = flight.ground_altitude;
   flight.last_altitude = flight.ground_altitude;
-  data.accel_vert_filt = data.gravity_magnitude;
+  data.accel_vert_filt = 0.0;  // Start at zero (gravity removed)
   
   // Print results
-  Serial.println("Calibration complete:");
+  Serial.println("✓ Calibration complete:");
   Serial.print("  Vertical axis: ");
   Serial.print((data.vertical_axis == 0) ? "X" : (data.vertical_axis == 1) ? "Y" : "Z");
   Serial.print(" (sign: ");
@@ -730,6 +777,16 @@ void run_state_machine() {
       } else {
         flight.launch_accel_count = 0;
       }
+      
+      #if GROUND_TEST_MODE
+      // Ground test: also allow altitude-based launch
+      if (agl > LAUNCH_ALTITUDE_THRESHOLD) {
+        flight.launch_time = now;
+        Serial.println("🚀 LAUNCH DETECTED (altitude - ground test mode)");
+        log_message("LAUNCH DETECTED (altitude)");
+        enter_state(BOOST);
+      }
+      #endif
       
       // Disarm with persistence to avoid false triggers from vibration
       {
@@ -900,16 +957,15 @@ void print_telemetry() {
   float agl = data.altitude_filt - flight.ground_altitude;
   
   // Console output
-  Serial.print(now / 1000.0, 2);
-  Serial.print(" | ");
+  Serial.print(now / 1000.0, 3);
+  Serial.print(",");
   Serial.print(state_names[state]);
-  Serial.print(" | AGL:");
-  Serial.print(agl, 1);
-  Serial.print("m V:");
-  Serial.print(data.velocity_filt, 1);
-  Serial.print("m/s A:");
-  Serial.print(data.accel_vert_filt, 2);
-  Serial.println("g");
+  Serial.print(",");
+  Serial.print(agl, 2);
+  Serial.print(",");
+  Serial.print(data.velocity_filt, 2);
+  Serial.print(",");
+  Serial.println(data.accel_vert_filt, 3);
   
   // Log to SD
   log_telemetry();
@@ -978,7 +1034,11 @@ void setup() {
   
   Serial.println("\n╔════════════════════════════════════╗");
   Serial.println("║  ROCKET FLIGHT COMPUTER v2.0      ║");
+  #if GROUND_TEST_MODE
+  Serial.println("║  ⚠️  GROUND TEST MODE ACTIVE ⚠️   ║");
+  #else
   Serial.println("║  Flight-Ready Edition              ║");
+  #endif
   Serial.println("╚════════════════════════════════════╝\n");
   
   flight.boot_time = millis();
@@ -1025,7 +1085,20 @@ void setup() {
   enter_state(PAD_IDLE);
   
   Serial.println("\n✓ System ready");
+  #if GROUND_TEST_MODE
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.println("   GROUND TEST MODE - Instructions:");
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.println("1. Keep still for 2s → ARMED");
+  Serial.println("2. Lift ~50cm up → LAUNCH/BOOST");
+  Serial.println("3. Hold high briefly → COAST");
+  Serial.println("4. Lower ~10cm → APOGEE");
+  Serial.println("5. Continue lowering → DESCENT");
+  Serial.println("6. Place on table → LANDED");
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+  #else
   Serial.println("Keep rocket still for 2 seconds to ARM");
+  #endif
   Serial.println("Logging to: " + String(filename));
   Serial.println("\nTime | State | AGL | Velocity | Accel\n");
 }
