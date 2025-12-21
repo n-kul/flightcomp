@@ -5,6 +5,10 @@
 #include <math.h>
 
 /* ===================== CONFIGURATION ===================== */
+// ***** GROUND TEST MODE *****
+// Set to true for bench testing at home, false for actual flight
+#define GROUND_TEST_MODE true
+
 // Hardware
 #define MPU_CS 5
 #define SD_CS 15
@@ -18,26 +22,50 @@
 #define ACCEL_STILLNESS_THRESHOLD 0.1  // g's - must be still on pad
 
 // Launch detection - CRITICAL: realistic thresholds for low-thrust motors
-#define LAUNCH_ACCEL_THRESHOLD 0.5      // g's above gravity (net accel)
+#if GROUND_TEST_MODE
+  #define LAUNCH_ACCEL_THRESHOLD 0.1      // Lowered for hand movement testing
+  #define LAUNCH_ALTITUDE_THRESHOLD 0.5   // 0.5m for ground test
+#else
+  #define LAUNCH_ACCEL_THRESHOLD 0.5      // g's above gravity (net accel)
+  #define LAUNCH_ALTITUDE_THRESHOLD 5.0   // meters
+#endif
 #define LAUNCH_ACCEL_SAMPLES 5          // Consecutive samples needed
 #define MIN_PAD_STILLNESS_TIME 2000     // ms - must be still before arming
 
 // Burnout detection
-#define BURNOUT_ACCEL_THRESHOLD 0.5     // g's - raised for noise immunity
-#define BURNOUT_MIN_TIME_MS 500         // Minimum burn time
+#if GROUND_TEST_MODE
+  #define BURNOUT_ACCEL_THRESHOLD 0.05    // Very sensitive for ground test
+  #define BURNOUT_MIN_TIME_MS 200         // Shorter for testing
+#else
+  #define BURNOUT_ACCEL_THRESHOLD 0.5     // g's - raised for noise immunity
+  #define BURNOUT_MIN_TIME_MS 500         // Minimum burn time
+#endif
 #define BURNOUT_CONFIRM_SAMPLES 8       // Consecutive low-accel samples
 
 // Apogee detection - altitude peak is PRIMARY, others are supporting
-#define APOGEE_VEL_THRESHOLD -0.5       // m/s - slight descent (helper only)
-#define APOGEE_ALT_WINDOW 0.3           // m - altitude not increasing (PRIMARY)
-#define APOGEE_MIN_ALTITUDE 15.0        // m - minimum AGL for valid apogee
-#define APOGEE_CONFIRM_SAMPLES 15       // Samples at 50Hz = 300ms
+#if GROUND_TEST_MODE
+  #define APOGEE_VEL_THRESHOLD -0.1       // Very sensitive for ground test
+  #define APOGEE_ALT_WINDOW 0.1           // 10cm drop from peak
+  #define APOGEE_MIN_ALTITUDE 0.3         // 30cm minimum for ground test
+  #define APOGEE_CONFIRM_SAMPLES 5        // Faster confirmation
+#else
+  #define APOGEE_VEL_THRESHOLD -0.5       // m/s - slight descent (helper only)
+  #define APOGEE_ALT_WINDOW 0.3           // m - altitude not increasing (PRIMARY)
+  #define APOGEE_MIN_ALTITUDE 15.0        // m - minimum AGL for valid apogee
+  #define APOGEE_CONFIRM_SAMPLES 15       // Samples at 50Hz = 300ms
+#endif
 #define APOGEE_ACCEL_THRESHOLD -0.5     // g's - should see descent accel
 
 // Landing detection
-#define LANDING_ALTITUDE_THRESHOLD 3.0  // m AGL
-#define LANDING_VELOCITY_THRESHOLD 2.0  // m/s
-#define LANDING_CONFIRM_TIME 2000       // ms
+#if GROUND_TEST_MODE
+  #define LANDING_ALTITUDE_THRESHOLD 0.2  // 20cm for ground test
+  #define LANDING_VELOCITY_THRESHOLD 0.3  // m/s
+  #define LANDING_CONFIRM_TIME 1000       // 1 second for testing
+#else
+  #define LANDING_ALTITUDE_THRESHOLD 3.0  // m AGL
+  #define LANDING_VELOCITY_THRESHOLD 2.0  // m/s
+  #define LANDING_CONFIRM_TIME 2000       // ms
+#endif
 
 // State timeouts (safety)
 #define BOOST_TIMEOUT_MS 15000
