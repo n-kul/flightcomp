@@ -12,6 +12,8 @@
 // Hardware
 #define MPU_CS 5
 #define SD_CS 15
+#define LED_PIN 27
+#define BUZZER_PIN 26
 
 // Timing - matched to BMP280 sampling capability
 #define LOOP_INTERVAL_MS 20     // 50Hz to match BMP280 with x16 oversampling
@@ -25,9 +27,11 @@
 #if GROUND_TEST_MODE
   #define LAUNCH_ACCEL_THRESHOLD 0.1      // Lowered for hand movement testing
   #define LAUNCH_ALTITUDE_THRESHOLD 0.5   // 0.5m for ground test
+  #define ALTITUDE_FILTER_ALPHA 0.85      // More aggressive for ground test
 #else
   #define LAUNCH_ACCEL_THRESHOLD 0.5      // g's above gravity (net accel)
   #define LAUNCH_ALTITUDE_THRESHOLD 5.0   // meters
+  #define ALTITUDE_FILTER_ALPHA 0.65      // Normal filtering for flight
 #endif
 #define LAUNCH_ACCEL_SAMPLES 5          // Consecutive samples needed
 #define MIN_PAD_STILLNESS_TIME 2000     // ms - must be still before arming
@@ -72,7 +76,6 @@
 #define COAST_TIMEOUT_MS 45000
 
 // Filtering
-#define ALTITUDE_FILTER_ALPHA 0.65
 #define ACCEL_FILTER_ALPHA 0.75
 #define VELOCITY_FILTER_ALPHA 0.6
 
@@ -156,6 +159,10 @@ SensorData data = {0};
 /* ===================== STATE TRACKING ===================== */
 struct FlightData {
   float ground_altitude;
+  float ground_altitude_initial;
+  unsigned long last_ground_update;
+  uint16_t ground_update_count;
+  
   float max_altitude;
   float max_velocity;
   float max_accel;
@@ -217,6 +224,150 @@ char filename[32];
 /* ===================== WATCHDOG ===================== */
 unsigned long lastLoopTime = 0;
 #define WATCHDOG_TIMEOUT_MS 1000
+
+/* ===================== AUDIO/VISUAL FEEDBACK ===================== */
+struct AVFeedback {
+  unsigned long last_beep_time;
+  unsigned long last_led_toggle;
+  bool led_state;
+  uint8_t beep_count;
+  uint8_t beeps_remaining;
+  unsigned long beep_interval;
+};
+
+AVFeedback av = {0};
+
+// Buzzer tones (frequency in Hz, duration in ms)
+void beep(uint16_t frequency, uint16_t duration) {
+  if (frequency > 0) {
+    tone(BUZZER_PIN, frequency, duration);
+  }
+  delay(duration);
+  noTone(BUZZER_PIN);
+}
+
+void play_armed_beeps() {
+  // Two quick beeps
+  beep(2000, 100);
+  delay(100);
+  beep(2000, 100);
+}
+
+void play_apogee_beep() {
+  // Single long beep
+  beep(2500, 300);
+}
+
+void play_landed_beep() {
+  // Three quick beeps
+  beep(1800, 100);
+  delay(80);
+  beep(1800, 100);
+  delay(80);
+  beep(1800, 100);
+}
+
+void play_error_tone() {
+  // Alternating error tone
+  beep(1000, 200);
+  delay(100);
+  beep(800, 200);
+}
+
+void update_av_feedback() {
+  unsigned long now = millis();
+  
+  switch(state) {
+    case BOOT:
+    case SENSOR_INIT:
+    case CALIBRATING:
+      // LED blinks slowly during init
+      if (now - av.last_led_toggle > 500) {
+        av.led_state = !av.led_state;
+        digitalWrite(LED_PIN, av.led_state);
+        av.last_led_toggle = now;
+      }
+      break;
+      
+    case PAD_IDLE:
+      // LED solid ON, no sound
+      digitalWrite(LED_PIN, HIGH);
+      break;
+      
+    case ARMED:
+      // LED flickers rapidly (100ms), two beeps on entry
+      static bool armed_beeps_played = false;
+      if (!armed_beeps_played) {
+        play_armed_beeps();
+        armed_beeps_played = true;
+      }
+      
+      if (now - av.last_led_toggle > 100) {
+        av.led_state = !av.led_state;
+        digitalWrite(LED_PIN, av.led_state);
+        av.last_led_toggle = now;
+      }
+      
+      // Reset flag when leaving ARMED
+      if (state != ARMED) {
+        armed_beeps_played = false;
+      }
+      break;
+      
+    case BOOST:
+    case COAST:
+      // LED OFF during ascent
+      digitalWrite(LED_PIN, LOW);
+      break;
+      
+    case APOGEE:
+      // Single beep, LED ON
+      static bool apogee_beep_played = false;
+      if (!apogee_beep_played) {
+        play_apogee_beep();
+        apogee_beep_played = true;
+      }
+      digitalWrite(LED_PIN, HIGH);
+      
+      if (state != APOGEE) {
+        apogee_beep_played = false;
+      }
+      break;
+      
+    case DESCENT:
+      // LED ON during descent (indicates logging active)
+      digitalWrite(LED_PIN, HIGH);
+      break;
+      
+    case LANDED:
+      // LED OFF, three beeps on entry
+      static bool landed_beeps_played = false;
+      if (!landed_beeps_played) {
+        play_landed_beep();
+        landed_beeps_played = true;
+      }
+      digitalWrite(LED_PIN, LOW);
+      
+      if (state != LANDED) {
+        landed_beeps_played = false;
+      }
+      break;
+      
+    case ERROR_STATE:
+      // LED blinks fast, error tone
+      if (now - av.last_led_toggle > 200) {
+        av.led_state = !av.led_state;
+        digitalWrite(LED_PIN, av.led_state);
+        av.last_led_toggle = now;
+      }
+      
+      if (now - av.last_beep_time > 2000) {
+        play_error_tone();
+        av.last_beep_time = now;
+      }
+      break;
+  }
+}
 
 /* ===================== UTILITIES ===================== */
 float iir_filter(float prev, float input, float alpha) {
@@ -357,7 +508,7 @@ void mpu_read_bytes(uint8_t reg, uint8_t *buf, uint8_t len) {
 }
 
 bool mpu_init() {
-  delay(100);  // Let sensor stabilize
+  delay(100);
   
   uint8_t who = mpu_read(WHO_AM_I);
   if (who != MPU6500_ID && who != MPU6000_ID) {
@@ -366,21 +517,14 @@ bool mpu_init() {
     return false;
   }
   
-  // Reset device
   mpu_write(PWR_MGMT_1, 0x80);
   delay(100);
   
-  // Wake up, use best clock
   mpu_write(PWR_MGMT_1, 0x01);
   delay(10);
   
-  // Configure gyro (not used but set anyway)
-  mpu_write(GYRO_CONFIG, 0x18);  // ±2000 dps
-  
-  // Configure accelerometer: ±16g for high-power rockets
-  mpu_write(ACCEL_CONFIG, 0x18);  // ±16g range
-  
-  // Low-pass filter: 92Hz bandwidth
+  mpu_write(GYRO_CONFIG, 0x18);
+  mpu_write(ACCEL_CONFIG, 0x18);
   mpu_write(CONFIG, 0x02);
   mpu_write(ACCEL_CONFIG2, 0x02);
   
@@ -401,7 +545,6 @@ void mpu_read_accel(float *ax, float *ay, float *az) {
   int16_t ay_raw = (buf[2] << 8) | buf[3];
   int16_t az_raw = (buf[4] << 8) | buf[5];
   
-  // ±16g range, 16-bit signed: sensitivity = 2048 LSB/g
   *ax = ax_raw / 2048.0;
   *ay = ay_raw / 2048.0;
   *az = az_raw / 2048.0;
@@ -448,7 +591,6 @@ bool bmp_init() {
     return false;
   }
   
-  // Read calibration
   uint8_t calib[24];
   bmp_read_bytes(0x88, calib, 24);
   
@@ -465,26 +607,23 @@ bool bmp_init() {
   dig_P8 = calib[20] | (calib[21] << 8);
   dig_P9 = calib[22] | (calib[23] << 8);
   
-  // Reset
   Wire.beginTransmission(BMP_ADDR);
   Wire.write(0xE0);
   Wire.write(0xB6);
   Wire.endTransmission();
   delay(10);
   
-  // Config: temp x2, pressure x16, normal mode
   Wire.beginTransmission(BMP_ADDR);
   Wire.write(0xF4);
   Wire.write(0x57);
   Wire.endTransmission();
   
-  // Filter coefficient 4, standby 0.5ms
   Wire.beginTransmission(BMP_ADDR);
   Wire.write(0xF5);
   Wire.write(0x0C);
   Wire.endTransmission();
   
-  delay(100);  // Let it stabilize
+  delay(100);
   
   Serial.print("BMP280 initialized (ID: 0x");
   Serial.print(chip_id, HEX);
@@ -499,12 +638,10 @@ float bmp_read_altitude() {
   
   if (adc_P == 0 || adc_T == 0) return -999.9;
   
-  // Temperature
   int32_t var1 = ((((adc_T >> 3) - ((int32_t)dig_T1 << 1))) * dig_T2) >> 11;
   int32_t var2 = (((((adc_T >> 4) - dig_T1) * ((adc_T >> 4) - dig_T1)) >> 12) * dig_T3) >> 14;
   t_fine = var1 + var2;
   
-  // Pressure
   int64_t p;
   int64_t v1 = ((int64_t)t_fine) - 128000;
   int64_t v2 = v1 * v1 * dig_P6;
@@ -537,7 +674,6 @@ void calibrate_sensors() {
   
   delay(500);
   
-  // Collect samples
   float ax_sum = 0, ay_sum = 0, az_sum = 0;
   float alt_sum = 0;
   int valid_samples = 0;
@@ -549,7 +685,6 @@ void calibrate_sensors() {
     mpu_read_accel(&ax, &ay, &az);
     float alt = bmp_read_altitude();
     
-    // Debug first few samples
     if (i < 5) {
       Serial.print("Sample ");
       Serial.print(i);
@@ -588,11 +723,13 @@ void calibrate_sensors() {
     return;
   }
   
-  // Calculate biases
   data.accel_x_bias = ax_sum / valid_samples;
   data.accel_y_bias = ay_sum / valid_samples;
   data.accel_z_bias = az_sum / valid_samples;
   flight.ground_altitude = alt_sum / valid_samples;
+  flight.ground_altitude_initial = flight.ground_altitude;
+  flight.last_ground_update = millis();
+  flight.ground_update_count = 0;
   
   Serial.print("Accel averages: X=");
   Serial.print(data.accel_x_bias, 3);
@@ -601,7 +738,6 @@ void calibrate_sensors() {
   Serial.print(" Z=");
   Serial.println(data.accel_z_bias, 3);
   
-  // Determine vertical axis (which axis is closest to ±1g)
   float ax_abs = fabsf(data.accel_x_bias);
   float ay_abs = fabsf(data.accel_y_bias);
   float az_abs = fabsf(data.accel_z_bias);
@@ -630,12 +766,10 @@ void calibrate_sensors() {
   Serial.print("Detected gravity magnitude: ");
   Serial.println(data.gravity_magnitude, 3);
   
-  // Validate - relaxed for ground testing
   #if GROUND_TEST_MODE
   if (data.gravity_magnitude < 0.5 || data.gravity_magnitude > 1.5) {
     Serial.println("⚠️  Warning: Unusual gravity reading, but continuing in test mode");
     Serial.println("    (This would fail in flight mode)");
-    // Continue anyway in test mode
   }
   #else
   if (data.gravity_magnitude < 0.8 || data.gravity_magnitude > 1.2) {
@@ -646,12 +780,10 @@ void calibrate_sensors() {
   }
   #endif
   
-  // Initialize filters
   data.altitude_filt = flight.ground_altitude;
   flight.last_altitude = flight.ground_altitude;
-  data.accel_vert_filt = 0.0;  // Start at zero (gravity removed)
+  data.accel_vert_filt = 0.0;
   
-  // Print results
   Serial.println("✓ Calibration complete:");
   Serial.print("  Vertical axis: ");
   Serial.print((data.vertical_axis == 0) ? "X" : (data.vertical_axis == 1) ? "Y" : "Z");
@@ -677,17 +809,14 @@ void update_sensors() {
   flight.dt = (now - flight.last_update_time) / 1000.0;
   flight.last_update_time = now;
   
-  // Validate dt
   if (flight.dt < 0.001 || flight.dt > 0.1) {
-    flight.dt = 0.01;  // Use expected dt
+    flight.dt = 0.01;
   }
   
-  // Read sensors
   float ax, ay, az;
   mpu_read_accel(&ax, &ay, &az);
   data.altitude_raw = bmp_read_altitude();
   
-  // Check validity
   if (data.altitude_raw < -900.0) {
     data.sensors_valid = false;
     data.sensor_errors++;
@@ -698,7 +827,6 @@ void update_sensors() {
   data.accel_y_raw = ay;
   data.accel_z_raw = az;
   
-  // Extract vertical acceleration (calibrated)
   float accel_on_axis;
   switch(data.vertical_axis) {
     case 0: accel_on_axis = ax; break;
@@ -707,17 +835,32 @@ void update_sensors() {
     default: accel_on_axis = az; break;
   }
   
-  // Apply sign and remove gravity to get vertical acceleration
   data.accel_vert_raw = data.vertical_sign * accel_on_axis - data.gravity_magnitude;
-  
-  // Calculate total acceleration magnitude
   data.accel_magnitude = sqrt(ax*ax + ay*ay + az*az);
   
-  // Apply filters
   data.altitude_filt = iir_filter(data.altitude_filt, data.altitude_raw, ALTITUDE_FILTER_ALPHA);
   data.accel_vert_filt = iir_filter(data.accel_vert_filt, data.accel_vert_raw, ACCEL_FILTER_ALPHA);
   
-  // Calculate velocity
+  // **DRIFT CORRECTION: Update ground reference when on pad**
+  if (state == PAD_IDLE || state == ARMED) {
+    if (fabsf(data.accel_vert_raw) < ACCEL_STILLNESS_THRESHOLD && 
+        data.accel_magnitude > 0.95 && data.accel_magnitude < 1.05) {
+      
+      flight.ground_altitude = iir_filter(flight.ground_altitude, data.altitude_filt, 0.995);
+      
+      if (now - flight.last_ground_update > 5000) {
+        float drift = flight.ground_altitude - flight.ground_altitude_initial;
+        if (fabsf(drift) > 0.5) {
+          char msg[64];
+          snprintf(msg, sizeof(msg), "Ground drift: %.2fm", drift);
+          Serial.println(msg);
+          log_message(msg);
+        }
+        flight.last_ground_update = now;
+      }
+    }
+  }
+  
   data.velocity = (data.altitude_filt - flight.last_altitude) / flight.dt;
   data.velocity_filt = iir_filter(data.velocity_filt, data.velocity, VELOCITY_FILTER_ALPHA);
   
@@ -726,7 +869,6 @@ void update_sensors() {
   data.last_mpu_read = now;
   data.last_bmp_read = now;
   
-  // Track maximums
   float agl = data.altitude_filt - flight.ground_altitude;
   if (agl > flight.max_altitude) flight.max_altitude = agl;
   if (data.velocity_filt > flight.max_velocity) flight.max_velocity = data.velocity_filt;
@@ -743,18 +885,15 @@ void run_state_machine() {
     case BOOT:
     case SENSOR_INIT:
     case CALIBRATING:
-      // Handled in setup
       break;
     
     case PAD_IDLE:
-      // If still for required time, arm
       if (fabsf(data.accel_vert_raw) < ACCEL_STILLNESS_THRESHOLD) {
         if (!flight.pad_is_still) {
           flight.pad_still_start = now;
           flight.pad_is_still = true;
         }
         
-        // If still for required time, arm
         if (now - flight.pad_still_start > MIN_PAD_STILLNESS_TIME) {
           flight.armed_time = now;
           enter_state(ARMED);
@@ -765,7 +904,6 @@ void run_state_machine() {
       break;
     
     case ARMED:
-      // Primary: Acceleration-based launch detect
       if (data.accel_vert_filt > LAUNCH_ACCEL_THRESHOLD) {
         flight.launch_accel_count++;
         if (flight.launch_accel_count >= LAUNCH_ACCEL_SAMPLES) {
@@ -779,7 +917,6 @@ void run_state_machine() {
       }
       
       #if GROUND_TEST_MODE
-      // Ground test: also allow altitude-based launch
       if (agl > LAUNCH_ALTITUDE_THRESHOLD) {
         flight.launch_time = now;
         Serial.println("🚀 LAUNCH DETECTED (altitude - ground test mode)");
@@ -788,7 +925,6 @@ void run_state_machine() {
       }
       #endif
       
-      // Disarm with persistence to avoid false triggers from vibration
       {
         static uint8_t move_count = 0;
         if (fabsf(data.accel_vert_filt) > ACCEL_STILLNESS_THRESHOLD * 3) {
@@ -806,12 +942,10 @@ void run_state_machine() {
       break;
     
     case BOOST:
-      // Burnout detection: sustained low acceleration
       if (data.accel_vert_filt < BURNOUT_ACCEL_THRESHOLD) {
         flight.burnout_confirm_count++;
         
         if (flight.burnout_confirm_count >= BURNOUT_CONFIRM_SAMPLES) {
-          // Also check minimum burn time
           if (now - flight.launch_time > BURNOUT_MIN_TIME_MS) {
             flight.burnout_time = now;
             Serial.println("Motor burnout");
@@ -823,7 +957,6 @@ void run_state_machine() {
         flight.burnout_confirm_count = 0;
       }
       
-      // Timeout safety
       if (now - flight.state_enter_time > BOOST_TIMEOUT_MS) {
         Serial.println("Boost timeout");
         log_message("BOOST_TIMEOUT");
@@ -833,28 +966,16 @@ void run_state_machine() {
     
     case COAST:
       {
-        // APOGEE DETECTION: Altitude peak is PRIMARY condition
-        // Velocity and acceleration are SUPPORTING evidence only
-        
-        // Track absolute peak altitude in this window
         if (agl > flight.apogee_altitude_window_max) {
           flight.apogee_altitude_window_max = agl;
-          flight.apogee_vote_count = 0;  // Reset if still climbing
+          flight.apogee_vote_count = 0;
         }
         
-        // PRIMARY: Altitude has peaked (not increasing beyond threshold)
         bool vote_altitude = (flight.apogee_altitude_window_max - agl) > APOGEE_ALT_WINDOW;
-        
-        // SUPPORTING: Acceleration shows descent
         bool vote_accel = data.accel_vert_filt < APOGEE_ACCEL_THRESHOLD;
-        
-        // SUPPORTING: Velocity is negative (helper only, not required)
         bool vote_velocity = data.velocity_filt < APOGEE_VEL_THRESHOLD;
-        
-        // GATE: Must be above minimum altitude
         bool vote_min_alt = agl > APOGEE_MIN_ALTITUDE;
         
-        // Require PRIMARY + at least one supporting condition
         bool apogee_detected = vote_altitude && (vote_accel || vote_velocity) && vote_min_alt;
         
         if (apogee_detected) {
@@ -862,7 +983,7 @@ void run_state_machine() {
           
           if (flight.apogee_vote_count >= APOGEE_CONFIRM_SAMPLES) {
             flight.apogee_time = now;
-            flight.apogee_altitude = flight.apogee_altitude_window_max;  // Use peak, not current
+            flight.apogee_altitude = flight.apogee_altitude_window_max;
             Serial.print("🎯 APOGEE! Altitude: ");
             Serial.print(flight.apogee_altitude, 2);
             Serial.println(" m");
@@ -871,11 +992,10 @@ void run_state_machine() {
           }
         } else {
           if (flight.apogee_vote_count > 0) {
-            flight.apogee_vote_count--;  // Decay counter
+            flight.apogee_vote_count--;
           }
         }
         
-        // Timeout safety
         if (now - flight.state_enter_time > COAST_TIMEOUT_MS) {
           Serial.println("Coast timeout");
           log_message("COAST_TIMEOUT");
@@ -886,13 +1006,10 @@ void run_state_machine() {
       break;
     
     case APOGEE:
-      // Transition immediately to descent
-      // This state exists for deployment event timing
       enter_state(DESCENT);
       break;
     
     case DESCENT:
-      // Landing detection: low altitude AND low velocity for sustained time
       if (agl < LANDING_ALTITUDE_THRESHOLD && fabsf(data.velocity_filt) < LANDING_VELOCITY_THRESHOLD) {
         if (flight.landing_detect_start == 0) {
           flight.landing_detect_start = now;
@@ -903,10 +1020,7 @@ void run_state_machine() {
           Serial.println("🎉 LANDED!");
           log_message("LANDED");
           print_flight_summary();
-          
-          // Force flush all logs on landing
           flush_log();
-          
           enter_state(LANDED);
         }
       } else {
@@ -915,7 +1029,6 @@ void run_state_machine() {
       break;
     
     case LANDED:
-      // Flush logs periodically and final flush
       {
         static unsigned long last_landed_flush = 0;
         if (now - last_landed_flush > 5000) {
@@ -926,7 +1039,6 @@ void run_state_machine() {
       break;
     
     case ERROR_STATE:
-      // Stay in error
       break;
   }
 }
@@ -936,18 +1048,17 @@ void print_telemetry() {
   static unsigned long last_print = 0;
   unsigned long now = millis();
   
-  // Adjust rate based on state
   unsigned long interval;
   switch(state) {
     case PAD_IDLE:
     case ARMED:
-      interval = 500;  // 2 Hz
+      interval = 500;
       break;
     case LANDED:
-      interval = 2000;  // 0.5 Hz
+      interval = 2000;
       break;
     default:
-      interval = 100;  // 10 Hz during flight
+      interval = 100;
       break;
   }
   
@@ -956,7 +1067,6 @@ void print_telemetry() {
   
   float agl = data.altitude_filt - flight.ground_altitude;
   
-  // Console output
   Serial.print(now / 1000.0, 3);
   Serial.print(",");
   Serial.print(state_names[state]);
@@ -967,7 +1077,6 @@ void print_telemetry() {
   Serial.print(",");
   Serial.println(data.accel_vert_filt, 3);
   
-  // Log to SD
   log_telemetry();
 }
 
@@ -1032,6 +1141,16 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   
+  // Initialize LED and Buzzer
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  // Startup beep sequence
+  beep(1500, 100);
+  delay(100);
+  beep(2000, 100);
+  
   Serial.println("\n╔════════════════════════════════════╗");
   Serial.println("║  ROCKET FLIGHT COMPUTER v2.0      ║");
   #if GROUND_TEST_MODE
@@ -1044,21 +1163,18 @@ void setup() {
   flight.boot_time = millis();
   enter_state(BOOT);
   
-  // Initialize SD card first
   Serial.print("Initializing SD card... ");
   sdCardAvailable = init_sd_card();
   if (sdCardAvailable) {
     Serial.println("OK");
   }
   
-  // Initialize SPI for MPU
   pinMode(MPU_CS, OUTPUT);
   digitalWrite(MPU_CS, HIGH);
   SPI.begin(18, 19, 23, MPU_CS);
   
   enter_state(SENSOR_INIT);
   
-  // Initialize sensors
   Serial.print("Initializing MPU6500... ");
   if (!mpu_init()) {
     enter_error_state("MPU6500 init failed");
@@ -1073,13 +1189,11 @@ void setup() {
   }
   Serial.println("OK");
   
-  // Calibrate
   enter_state(CALIBRATING);
   calibrate_sensors();
   
   if (state == ERROR_STATE) return;
   
-  // Ready
   flight.last_update_time = millis();
   lastLoopTime = millis();
   enter_state(PAD_IDLE);
@@ -1108,12 +1222,10 @@ void loop() {
   static unsigned long last_loop = 0;
   unsigned long now = millis();
   
-  // Fixed interval timing
   if (now - last_loop < LOOP_INTERVAL_MS) {
     return;
   }
   
-  // Check for overruns
   if (now - last_loop > LOOP_INTERVAL_MS * 2) {
     flight.loop_overruns++;
   }
@@ -1121,15 +1233,14 @@ void loop() {
   last_loop = now;
   flight.loop_count++;
   
-  // Watchdog
   check_watchdog();
   
   if (state == ERROR_STATE) {
+    update_av_feedback();
     delay(1000);
     return;
   }
   
-  // Update sensors
   update_sensors();
   
   if (!data.sensors_valid) {
@@ -1142,15 +1253,12 @@ void loop() {
     return;
   }
   
-  // Run state machine
   run_state_machine();
-  
-  // Print telemetry
   print_telemetry();
+  update_av_feedback();
   
-  // Flush logs periodically (but NOT during critical flight phases)
   if (sdCardAvailable && now - lastFlush > LOG_FLUSH_INTERVAL) {
-    flush_log();  // flush_log() internally checks for critical states
+    flush_log();
     lastFlush = now;
   }
 }
