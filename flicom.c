@@ -11,9 +11,11 @@
 
 // Hardware
 #define MPU_CS 5
-#define SD_CS 15
+#define SD_CS 13
 #define LED_PIN 27
 #define BUZZER_PIN 26
+#define NRF_CE 16
+#define NRF_CSN 17
 
 // Timing - matched to BMP280 sampling capability
 #define LOOP_INTERVAL_MS 20     // 50Hz to match BMP280 with x16 oversampling
@@ -97,6 +99,52 @@
 #define MPU6000_ID     0x68
 
 SPISettings mpuSPI(1000000, MSBFIRST, SPI_MODE0);
+
+/* ===================== NRF24L01 ===================== */
+#define NRF_CONFIG      0x00
+#define NRF_EN_AA       0x01
+#define NRF_EN_RXADDR   0x02
+#define NRF_SETUP_AW    0x03
+#define NRF_SETUP_RETR  0x04
+#define NRF_RF_CH       0x05
+#define NRF_RF_SETUP    0x06
+#define NRF_STATUS      0x07
+#define NRF_RX_ADDR_P0  0x0A
+#define NRF_TX_ADDR     0x10
+#define NRF_RX_PW_P0    0x11
+#define NRF_FIFO_STATUS 0x17
+#define NRF_DYNPD       0x1C
+#define NRF_FEATURE     0x1D
+
+#define NRF_CMD_R_REGISTER    0x00
+#define NRF_CMD_W_REGISTER    0x20
+#define NRF_CMD_R_RX_PAYLOAD  0x61
+#define NRF_CMD_W_TX_PAYLOAD  0xA0
+#define NRF_CMD_FLUSH_TX      0xE1
+#define NRF_CMD_FLUSH_RX      0xE2
+#define NRF_CMD_NOP           0xFF
+
+#define NRF_CHANNEL 92  // Non-WiFi channel, avoids 2.4GHz overlap
+
+bool nrfAvailable = false;
+uint8_t txAddress[5] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};
+unsigned long lastNrfStatusCheck = 0;
+
+// Telemetry packet structure (32 bytes max for NRF24)
+struct TelemetryPacket {
+  uint32_t timestamp;      // 4 bytes
+  uint8_t state;           // 1 byte
+  float altitude;          // 4 bytes
+  float velocity;          // 4 bytes
+  float acceleration;      // 4 bytes
+  float max_altitude;      // 4 bytes
+  float max_velocity;      // 4 bytes
+  float max_accel;         // 4 bytes
+  uint8_t battery_percent; // 1 byte (future use)
+  uint8_t checksum;        // 1 byte
+} __attribute__((packed));  // Total: 31 bytes
+
+TelemetryPacket txPacket;
 
 /* ===================== BMP280 ===================== */
 #define BMP_ADDR 0x76
@@ -236,6 +284,190 @@ struct AVFeedback {
 };
 
 AVFeedback av = {0};
+
+/* ===================== NRF24L01 FUNCTIONS ===================== */
+uint8_t nrf_read_register(uint8_t reg) {
+  digitalWrite(NRF_CSN, LOW);
+  SPI.transfer(NRF_CMD_R_REGISTER | (reg & 0x1F));
+  uint8_t result = SPI.transfer(0xFF);
+  digitalWrite(NRF_CSN, HIGH);
+  return result;
+}
+
+void nrf_write_register(uint8_t reg, uint8_t value) {
+  digitalWrite(NRF_CSN, LOW);
+  SPI.transfer(NRF_CMD_W_REGISTER | (reg & 0x1F));
+  SPI.transfer(value);
+  digitalWrite(NRF_CSN, HIGH);
+}
+
+void nrf_write_register_multi(uint8_t reg, const uint8_t* data, uint8_t len) {
+  digitalWrite(NRF_CSN, LOW);
+  SPI.transfer(NRF_CMD_W_REGISTER | (reg & 0x1F));
+  for (uint8_t i = 0; i < len; i++) {
+    SPI.transfer(data[i]);
+  }
+  digitalWrite(NRF_CSN, HIGH);
+}
+
+void nrf_flush_tx() {
+  digitalWrite(NRF_CSN, LOW);
+  SPI.transfer(NRF_CMD_FLUSH_TX);
+  digitalWrite(NRF_CSN, HIGH);
+}
+
+void nrf_flush_rx() {
+  digitalWrite(NRF_CSN, LOW);
+  SPI.transfer(NRF_CMD_FLUSH_RX);
+  digitalWrite(NRF_CSN, HIGH);
+}
+
+bool nrf_init() {
+  pinMode(NRF_CE, OUTPUT);
+  pinMode(NRF_CSN, OUTPUT);
+  digitalWrite(NRF_CE, LOW);
+  digitalWrite(NRF_CSN, HIGH);
+  
+  delay(100);
+  
+  // Check communication by reading/writing CONFIG register
+  nrf_write_register(NRF_CONFIG, 0x0C);
+  delay(5);
+  uint8_t config = nrf_read_register(NRF_CONFIG);
+  
+  if (config != 0x0C) {
+    Serial.print("NRF24L01 init failed - CONFIG read: 0x");
+    Serial.println(config, HEX);
+    return false;
+  }
+  
+  // Configure NRF24L01 for TX mode (PA+LNA optimized)
+  nrf_write_register(NRF_CONFIG, 0x0E);        // Power up, TX mode, CRC enabled (2 bytes)
+  nrf_write_register(NRF_EN_AA, 0x00);         // DISABLED - no auto-ack (fire-and-forget)
+  nrf_write_register(NRF_EN_RXADDR, 0x00);     // RX disabled (TX only)
+  nrf_write_register(NRF_SETUP_AW, 0x03);      // 5-byte address width
+  nrf_write_register(NRF_SETUP_RETR, 0x00);    // DISABLED - no retries (fire-and-forget)
+  nrf_write_register(NRF_RF_CH, NRF_CHANNEL);  // Channel 92 (non-WiFi)
+  nrf_write_register(NRF_RF_SETUP, 0x01);      // 1Mbps, -18dBm (PA+LNA will amplify)
+  nrf_write_register(NRF_RX_PW_P0, 32);        // 32-byte payload
+  
+  // Set TX address
+  nrf_write_register_multi(NRF_TX_ADDR, txAddress, 5);
+  
+  // Flush FIFOs
+  nrf_flush_tx();
+  nrf_flush_rx();
+  
+  // Clear status flags
+  nrf_write_register(NRF_STATUS, 0x70);
+  
+  delay(10);
+  
+  Serial.print("NRF24L01 initialized (Channel ");
+  Serial.print(NRF_CHANNEL);
+  Serial.println(", PA+LNA mode)");
+  return true;
+}
+
+void nrf_transmit_packet(const uint8_t* data, uint8_t len) {
+  if (!nrfAvailable || len > 32) return;
+  
+  // CRITICAL: CE pin sanity reset (protects against SPI glitches)
+  digitalWrite(NRF_CE, LOW);
+  delayMicroseconds(5);
+  
+  // Write payload
+  digitalWrite(NRF_CSN, LOW);
+  SPI.transfer(NRF_CMD_W_TX_PAYLOAD);
+  for (uint8_t i = 0; i < len; i++) {
+    SPI.transfer(data[i]);
+  }
+  digitalWrite(NRF_CSN, HIGH);
+  
+  // Pulse CE to transmit (fire-and-forget)
+  digitalWrite(NRF_CE, HIGH);
+  delayMicroseconds(15);
+  digitalWrite(NRF_CE, LOW);
+}
+
+void nrf_check_status() {
+  if (!nrfAvailable) return;
+  
+  // Check status ~1-2 Hz to clear MAX_RT if it latches
+  unsigned long now = millis();
+  if (now - lastNrfStatusCheck < 500) return;
+  lastNrfStatusCheck = now;
+  
+  uint8_t status = nrf_read_register(NRF_STATUS);
+  
+  // Check for MAX_RT (max retries reached - but we disabled retries, so shouldn't happen)
+  // Check anyway as safety measure
+  if (status & (1 << 4)) {
+    nrf_flush_tx();
+    nrf_write_register(NRF_STATUS, (1 << 4));  // Clear MAX_RT flag
+  }
+  
+  // Check for TX_DS (data sent) - clear it
+  if (status & (1 << 5)) {
+    nrf_write_register(NRF_STATUS, (1 << 5));  // Clear TX_DS flag
+  }
+}
+
+uint8_t calculate_checksum(const uint8_t* data, uint8_t len) {
+  uint8_t sum = 0;
+  for (uint8_t i = 0; i < len; i++) {
+    sum ^= data[i];
+  }
+  return sum;
+}
+
+void send_telemetry() {
+  if (!nrfAvailable) return;
+  
+  static unsigned long last_tx = 0;
+  unsigned long now = millis();
+  
+  // Transmission rate based on state
+  unsigned long tx_interval;
+  switch(state) {
+    case BOOST:
+    case COAST:
+    case APOGEE:
+    case DESCENT:
+      tx_interval = 50;  // 20 Hz during flight
+      break;
+    case ARMED:
+      tx_interval = 200;  // 5 Hz when armed
+      break;
+    case PAD_IDLE:
+    case LANDED:
+      tx_interval = 1000;  // 1 Hz on pad/landed
+      break;
+    default:
+      tx_interval = 500;  // 2 Hz otherwise
+      break;
+  }
+  
+  if (now - last_tx < tx_interval) return;
+  last_tx = now;
+  
+  // Populate packet
+  txPacket.timestamp = now;
+  txPacket.state = state;
+  txPacket.altitude = data.altitude_filt - flight.ground_altitude;
+  txPacket.velocity = data.velocity_filt;
+  txPacket.acceleration = data.accel_vert_filt;
+  txPacket.max_altitude = flight.max_altitude;
+  txPacket.max_velocity = flight.max_velocity;
+  txPacket.max_accel = flight.max_accel;
+  txPacket.battery_percent = 100;  // TODO: Add battery monitoring
+  
+  // Calculate checksum (exclude checksum byte itself)
+  txPacket.checksum = calculate_checksum((uint8_t*)&txPacket, sizeof(TelemetryPacket) - 1);
+  
+  // Transmit
+  nrf_transmit_packet((uint8_t*)&txPacket, sizeof(TelemetryPacket));
+}
 
 // Buzzer tones (frequency in Hz, duration in ms)
 void beep(uint16_t frequency, uint16_t duration) {
@@ -1189,6 +1421,15 @@ void setup() {
   }
   Serial.println("OK");
   
+  Serial.print("Initializing NRF24L01... ");
+  nrfAvailable = nrf_init();
+  if (nrfAvailable) {
+    Serial.println("OK");
+    beep(2200, 100);  // Success beep
+  } else {
+    Serial.println("DISABLED - telemetry unavailable");
+  }
+  
   enter_state(CALIBRATING);
   calibrate_sensors();
   
@@ -1256,6 +1497,8 @@ void loop() {
   run_state_machine();
   print_telemetry();
   update_av_feedback();
+  send_telemetry();  // Transmit telemetry via NRF24L01
+  nrf_check_status(); // Check NRF status periodically (~1-2 Hz)
   
   if (sdCardAvailable && now - lastFlush > LOG_FLUSH_INTERVAL) {
     flush_log();
