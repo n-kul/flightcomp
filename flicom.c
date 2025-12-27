@@ -9,13 +9,21 @@
 // Set to true for bench testing at home, false for actual flight
 #define GROUND_TEST_MODE true
 
-// Hardware
+// Hardware - SPI Bus Assignments
+// VSPI (Default SPI): MPU6500, NRF24L01
 #define MPU_CS 5
-#define SD_CS 13
-#define LED_PIN 27
-#define BUZZER_PIN 26
 #define NRF_CE 16
 #define NRF_CSN 17
+
+// HSPI (Secondary SPI): SD Card (separate bus - no contention!)
+#define SD_CS 4
+#define SD_SCK 14
+#define SD_MISO 12
+#define SD_MOSI 13
+
+// Other peripherals
+#define LED_PIN 27
+#define BUZZER_PIN 26
 #define PYRO_PIN 25
 
 // Pyro settings
@@ -104,6 +112,9 @@
 #define MPU6000_ID     0x68
 
 SPISettings mpuSPI(1000000, MSBFIRST, SPI_MODE0);
+
+// Create HSPI instance for SD card (separate SPI bus)
+SPIClass hspi(HSPI);
 
 /* ===================== NRF24L01 ===================== */
 #define NRF_CONFIG      0x00
@@ -722,7 +733,10 @@ void flush_log() {
 }
 
 bool init_sd_card() {
-  if (!SD.begin(SD_CS)) {
+  // Initialize HSPI for SD card (separate bus from VSPI)
+  hspi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  
+  if (!SD.begin(SD_CS, hspi)) {
     Serial.println("SD card init failed - logging disabled");
     return false;
   }
@@ -1449,7 +1463,12 @@ void setup() {
   flight.boot_time = millis();
   enter_state(BOOT);
   
-  Serial.print("Initializing SD card... ");
+  // Initialize VSPI for sensors (MPU6500, NRF24L01)
+  pinMode(MPU_CS, OUTPUT);
+  digitalWrite(MPU_CS, HIGH);
+  SPI.begin(18, 19, 23, MPU_CS);  // VSPI: SCK=18, MISO=19, MOSI=23
+  
+  Serial.print("Initializing SD card (HSPI)... ");
   sdCardAvailable = init_sd_card();
   if (sdCardAvailable) {
     Serial.println("OK");
@@ -1457,6 +1476,7 @@ void setup() {
   
   pinMode(MPU_CS, OUTPUT);
   digitalWrite(MPU_CS, HIGH);
+  
   SPI.begin(18, 19, 23, MPU_CS);
   
   enter_state(SENSOR_INIT);
