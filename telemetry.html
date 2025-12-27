@@ -37,6 +37,13 @@
       letter-spacing: 0.5px;
     }
 
+    .status-row {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
     .connection-status {
       display: inline-flex;
       align-items: center;
@@ -45,7 +52,7 @@
       background: #0a0e1a;
       border-radius: 3px;
       border: 1px solid #1e2433;
-      font-size: 0.9em;
+      font-size: 0.85em;
     }
 
     .status-dot {
@@ -57,6 +64,10 @@
 
     .status-dot.connected {
       background: #28a745;
+    }
+
+    .status-dot.fired {
+      background: #ffc107;
     }
 
     .controls {
@@ -104,7 +115,7 @@
       grid-template-columns: 1fr 380px 1fr;
       gap: 20px;
       margin-bottom: 20px;
-      height: calc(100vh - 220px);
+      height: calc(100vh - 260px);
       min-height: 600px;
     }
 
@@ -299,9 +310,19 @@
 <body>
   <div class="header">
     <h1>ROCKET TELEMETRY DASHBOARD</h1>
-    <div class="connection-status">
-      <div class="status-dot" id="statusDot"></div>
-      <span id="statusText">DISCONNECTED</span>
+    <div class="status-row">
+      <div class="connection-status">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">SERIAL: DISCONNECTED</span>
+      </div>
+      <div class="connection-status">
+        <div class="status-dot" id="nrfStatusDot"></div>
+        <span id="nrfStatusText">NRF: UNKNOWN</span>
+      </div>
+      <div class="connection-status">
+        <div class="status-dot" id="pyroStatusDot"></div>
+        <span id="pyroStatusText">PYRO: SAFE</span>
+      </div>
     </div>
   </div>
 
@@ -436,6 +457,12 @@
       dataCount: 0
     };
 
+    let systemStatus = {
+      nrfConnected: false,
+      pyroFired: false,
+      serialConnected: false
+    };
+
     let serialPort = null;
     let reader = null;
 
@@ -538,13 +565,13 @@
         serialPort = await navigator.serial.requestPort();
         await serialPort.open({ baudRate: 115200 });
         
-        updateConnectionStatus(true);
+        updateSerialStatus(true);
         addLog('Serial port connected', 'success');
         
         readSerialData();
       } catch (error) {
         addLog('Connection failed: ' + error.message, 'error');
-        updateConnectionStatus(false);
+        updateSerialStatus(false);
       }
     });
 
@@ -570,7 +597,7 @@
         }
       } catch (error) {
         addLog('Serial read error: ' + error.message, 'error');
-        updateConnectionStatus(false);
+        updateSerialStatus(false);
       }
     }
 
@@ -586,6 +613,21 @@
         const accel = parseFloat(parts[4]);
         
         addDataPoint(time, state, altitude, velocity, accel);
+      } else if (line.includes('NRF24L01 initialized')) {
+        systemStatus.nrfConnected = true;
+        updateNrfStatus(true);
+        addLog('NRF24L01 radio active', 'success');
+      } else if (line.includes('NRF24L01 init failed') || line.includes('DISABLED - telemetry unavailable')) {
+        systemStatus.nrfConnected = false;
+        updateNrfStatus(false);
+        addLog('NRF24L01 radio unavailable', 'warning');
+      } else if (line.includes('PYRO FIRED')) {
+        systemStatus.pyroFired = true;
+        updatePyroStatus(true);
+        addLog('🔥 PYRO CHANNEL FIRED - PARACHUTE DEPLOYED', 'warning');
+      } else if (line.includes('PYRO CUTOFF')) {
+        updatePyroStatus(false);
+        addLog('Pyro channel safe', 'info');
       } else if (line.includes('LAUNCH') || line.includes('APOGEE') || line.includes('LANDED')) {
         addLog(line, 'info');
       }
@@ -623,6 +665,9 @@
           if (!isNaN(altitude)) {
             addDataPoint(time, state, altitude, velocity, accel);
           }
+        } else if (line.includes('PYRO FIRED')) {
+          systemStatus.pyroFired = true;
+          updatePyroStatus(true);
         }
       }
       
@@ -697,16 +742,44 @@
       accelChart.update('none');
     }
 
-    function updateConnectionStatus(connected) {
+    function updateSerialStatus(connected) {
       const dot = document.getElementById('statusDot');
       const text = document.getElementById('statusText');
+      systemStatus.serialConnected = connected;
       
       if (connected) {
         dot.classList.add('connected');
-        text.textContent = 'CONNECTED';
+        text.textContent = 'SERIAL: CONNECTED';
       } else {
         dot.classList.remove('connected');
-        text.textContent = 'DISCONNECTED';
+        text.textContent = 'SERIAL: DISCONNECTED';
+      }
+    }
+
+    function updateNrfStatus(connected) {
+      const dot = document.getElementById('nrfStatusDot');
+      const text = document.getElementById('nrfStatusText');
+      
+      if (connected) {
+        dot.classList.add('connected');
+        text.textContent = 'NRF: ACTIVE';
+      } else {
+        dot.classList.remove('connected');
+        text.textContent = 'NRF: OFFLINE';
+      }
+    }
+
+    function updatePyroStatus(fired) {
+      const dot = document.getElementById('pyroStatusDot');
+      const text = document.getElementById('pyroStatusText');
+      
+      if (fired) {
+        dot.classList.remove('connected');
+        dot.classList.add('fired');
+        text.textContent = 'PYRO: FIRED';
+      } else {
+        dot.classList.remove('fired');
+        text.textContent = 'PYRO: SAFE';
       }
     }
 
@@ -743,6 +816,10 @@
         startTime: null,
         dataCount: 0
       };
+      
+      // Reset pyro status when clearing data
+      systemStatus.pyroFired = false;
+      updatePyroStatus(false);
       
       updateCharts();
       
