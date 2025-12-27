@@ -16,6 +16,11 @@
 #define BUZZER_PIN 26
 #define NRF_CE 16
 #define NRF_CSN 17
+#define PYRO_PIN 25
+
+// Pyro settings
+#define PYRO_FIRE_DURATION 1000  // 1 second pulse duration (ms)
+#define PYRO_DELAY_AFTER_APOGEE 200  // 200ms delay after apogee detection (ms)
 
 // Timing - matched to BMP280 sampling capability
 #define LOOP_INTERVAL_MS 20     // 50Hz to match BMP280 with x16 oversampling
@@ -242,6 +247,10 @@ struct FlightData {
   // Landing detection
   unsigned long landing_detect_start;
   
+  // Pyro control
+  bool pyro_fired;
+  unsigned long pyro_fire_time;
+  
   // Loop timing
   float last_altitude;
   unsigned long last_update_time;
@@ -284,6 +293,38 @@ struct AVFeedback {
 };
 
 AVFeedback av = {0};
+
+/* ===================== PYRO CONTROL ===================== */
+void fire_pyro() {
+  if (flight.pyro_fired) return;  // Safety: only fire once
+  
+  digitalWrite(PYRO_PIN, HIGH);
+  flight.pyro_fired = true;
+  flight.pyro_fire_time = millis();
+  
+  Serial.println("🔥 PYRO FIRED - PARACHUTE DEPLOYMENT");
+  log_message("PYRO FIRED");
+  
+  // Audible confirmation
+  beep(3000, 200);
+}
+
+void update_pyro() {
+  // If pyro is fired, turn it off after duration
+  if (flight.pyro_fired && !digitalRead(PYRO_PIN)) {
+    // Already turned off, nothing to do
+    return;
+  }
+  
+  if (flight.pyro_fired) {
+    unsigned long now = millis();
+    if (now - flight.pyro_fire_time >= PYRO_FIRE_DURATION) {
+      digitalWrite(PYRO_PIN, LOW);
+      Serial.println("Pyro cutoff");
+      log_message("PYRO CUTOFF");
+    }
+  }
+}
 
 /* ===================== NRF24L01 FUNCTIONS ===================== */
 uint8_t nrf_read_register(uint8_t reg) {
@@ -1238,7 +1279,18 @@ void run_state_machine() {
       break;
     
     case APOGEE:
-      enter_state(DESCENT);
+      // Fire pyro after short delay for apogee confirmation
+      {
+        unsigned long now = millis();
+        if (!flight.pyro_fired && (now - flight.state_enter_time >= PYRO_DELAY_AFTER_APOGEE)) {
+          fire_pyro();
+        }
+      }
+      
+      // Transition to descent after pyro fires or timeout
+      if (flight.pyro_fired || (millis() - flight.state_enter_time > 500)) {
+        enter_state(DESCENT);
+      }
       break;
     
     case DESCENT:
@@ -1376,7 +1428,9 @@ void setup() {
   // Initialize LED and Buzzer
   pinMode(LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(PYRO_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+  digitalWrite(PYRO_PIN, LOW);  // CRITICAL: Pyro starts LOW (safe)
   
   // Startup beep sequence
   beep(1500, 100);
@@ -1497,6 +1551,7 @@ void loop() {
   run_state_machine();
   print_telemetry();
   update_av_feedback();
+  update_pyro();  // Monitor and cut off pyro after duration
   send_telemetry();  // Transmit telemetry via NRF24L01
   nrf_check_status(); // Check NRF status periodically (~1-2 Hz)
   
