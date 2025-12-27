@@ -18,7 +18,7 @@
 // HSPI (Secondary SPI): SD Card (separate bus - no contention!)
 #define SD_CS 4
 #define SD_SCK 14
-#define SD_MISO 12
+#define SD_MISO 35
 #define SD_MOSI 13
 
 // Other peripherals
@@ -261,6 +261,12 @@ struct FlightData {
   // Pyro control
   bool pyro_fired;
   unsigned long pyro_fire_time;
+  // State-specific flags (moved from static variables)
+  uint8_t armed_move_count;
+  bool armed_beeps_played;
+  bool apogee_beep_played;
+  bool landed_beeps_played;
+  bool descent_entry_check_done;
   
   // Loop timing
   float last_altitude;
@@ -321,13 +327,8 @@ void fire_pyro() {
 }
 
 void update_pyro() {
-  // If pyro is fired, turn it off after duration
-  if (flight.pyro_fired && !digitalRead(PYRO_PIN)) {
-    // Already turned off, nothing to do
-    return;
-  }
-  
-  if (flight.pyro_fired) {
+  // Auto-cutoff pyro after fire duration
+  if (flight.pyro_fired && digitalRead(PYRO_PIN) == HIGH) {
     unsigned long now = millis();
     if (now - flight.pyro_fire_time >= PYRO_FIRE_DURATION) {
       digitalWrite(PYRO_PIN, LOW);
@@ -580,21 +581,15 @@ void update_av_feedback() {
       
     case ARMED:
       // LED flickers rapidly (100ms), two beeps on entry
-      static bool armed_beeps_played = false;
-      if (!armed_beeps_played) {
+      if (!flight.armed_beeps_played) {
         play_armed_beeps();
-        armed_beeps_played = true;
+        flight.armed_beeps_played = true;
       }
-      
+  
       if (now - av.last_led_toggle > 100) {
         av.led_state = !av.led_state;
         digitalWrite(LED_PIN, av.led_state);
         av.last_led_toggle = now;
-      }
-      
-      // Reset flag when leaving ARMED
-      if (state != ARMED) {
-        armed_beeps_played = false;
       }
       break;
       
@@ -606,16 +601,11 @@ void update_av_feedback() {
       
     case APOGEE:
       // Single beep, LED ON
-      static bool apogee_beep_played = false;
-      if (!apogee_beep_played) {
-        play_apogee_beep();
-        apogee_beep_played = true;
+      if (!flight.apogee_beep_played) {
+      play_apogee_beep();
+      flight.apogee_beep_played = true;
       }
       digitalWrite(LED_PIN, HIGH);
-      
-      if (state != APOGEE) {
-        apogee_beep_played = false;
-      }
       break;
       
     case DESCENT:
@@ -625,16 +615,11 @@ void update_av_feedback() {
       
     case LANDED:
       // LED OFF, three beeps on entry
-      static bool landed_beeps_played = false;
-      if (!landed_beeps_played) {
+      if (!flight.landed_beeps_played) {
         play_landed_beep();
-        landed_beeps_played = true;
+        flight.landed_beeps_played = true;
       }
       digitalWrite(LED_PIN, LOW);
-      
-      if (state != LANDED) {
-        landed_beeps_played = false;
-      }
       break;
       
     case ERROR_STATE:
@@ -659,6 +644,26 @@ float iir_filter(float prev, float input, float alpha) {
 }
 
 void enter_state(flight_state_t new_state) {
+  // Reset state-specific flags when leaving states
+  if (state == ARMED && new_state != ARMED) {
+    flight.armed_move_count = 0;
+    flight.armed_beeps_played = false;
+  }
+  if (state == APOGEE && new_state != APOGEE) {
+    flight.apogee_beep_played = false;
+  }
+  if (state == LANDED && new_state != LANDED) {
+    flight.landed_beeps_played = false;
+  }
+  if (state == DESCENT && new_state != DESCENT) {
+    flight.descent_entry_check_done = false;
+  }
+  
+  // Initialize apogee window when entering COAST
+  if (new_state == COAST) {
+    flight.apogee_altitude_window_max = data.altitude_filt - flight.ground_altitude;
+  }
+  
   state = new_state;
   flight.state_enter_time = millis();
   
@@ -1213,14 +1218,13 @@ void run_state_machine() {
       #endif
       
       {
-        static uint8_t move_count = 0;
         if (fabsf(data.accel_vert_filt) > ACCEL_STILLNESS_THRESHOLD * 3) {
-          move_count++;
+          flight.armed_move_count++;
         } else {
-          move_count = 0;
+          flight.armed_move_count = 0;
         }
         
-        if (move_count > 5) {
+        if (flight.armed_move_count > 5) {
           Serial.println("Disarmed - rocket moved");
           log_message("DISARMED");
           enter_state(PAD_IDLE);
@@ -1271,11 +1275,12 @@ void run_state_machine() {
           if (flight.apogee_vote_count >= APOGEE_CONFIRM_SAMPLES) {
             flight.apogee_time = now;
             flight.apogee_altitude = flight.apogee_altitude_window_max;
-            Serial.print("🎯 APOGEE! Altitude: ");
+            Serial.print("APOGEE! Altitude: ");
             Serial.print(flight.apogee_altitude, 2);
             Serial.println(" m");
             log_message("APOGEE DETECTED");
             enter_state(APOGEE);
+            break;
           }
         } else {
           if (flight.apogee_vote_count > 0) {
@@ -1283,11 +1288,24 @@ void run_state_machine() {
           }
         }
         
-        if (now - flight.state_enter_time > COAST_TIMEOUT_MS) {
-          Serial.println("Coast timeout");
-          log_message("COAST_TIMEOUT");
-          flight.apogee_altitude = flight.max_altitude;
-          enter_state(DESCENT);
+       if (now - flight.state_enter_time > COAST_TIMEOUT_MS) {
+        Serial.println("COAST TIMEOUT - APOGEE DETECTION FAILED");
+        log_message("COAST_TIMEOUT - APOGEE DETECTION FAILED");
+  
+  // Record best estimate of apogee
+        flight.apogee_altitude = flight.max_altitude;
+        flight.apogee_time = now;
+  
+  // CRITICAL: Fire pyro immediately (emergency deployment)
+        if (!flight.pyro_fired) {
+          Serial.println("EMERGENCY PYRO FIRE (coast timeout)");
+          log_message("PYRO EMERGENCY FIRE - COAST TIMEOUT");
+          fire_pyro();
+        }
+  
+  // Go directly to DESCENT
+        enter_state(DESCENT);
+        break;
         }
       }
       break;
@@ -1308,24 +1326,39 @@ void run_state_machine() {
       break;
     
     case DESCENT:
-      if (agl < LANDING_ALTITUDE_THRESHOLD && fabsf(data.velocity_filt) < LANDING_VELOCITY_THRESHOLD) {
-        if (flight.landing_detect_start == 0) {
-          flight.landing_detect_start = now;
-        }
-        
-        if (now - flight.landing_detect_start > LANDING_CONFIRM_TIME) {
-          flight.landing_time = now;
-          Serial.println("🎉 LANDED!");
-          log_message("LANDED");
-          print_flight_summary();
-          flush_log();
-          enter_state(LANDED);
-        }
-      } else {
-        flight.landing_detect_start = 0;
+  // BACKUP SAFETY: Ensure pyro fired (defense in depth)
+  // This should NEVER trigger if above logic works correctly
+  { 
+    if (!flight.descent_entry_check_done) {
+      if (!flight.pyro_fired) {
+        // Critical failure - pyro should have fired by now
+        Serial.println("CRITICAL: PYRO NOT FIRED IN DESCENT!");
+        Serial.println("EMERGENCY DEPLOYMENT NOW!");
+        log_message("CRITICAL FAILURE - PYRO NOT FIRED - EMERGENCY DEPLOY");
+        fire_pyro();
       }
-      break;
+      flight.descent_entry_check_done = true;
+    }
+  }
+  
+  // Landing detection
+  if (agl < LANDING_ALTITUDE_THRESHOLD && fabsf(data.velocity_filt) < LANDING_VELOCITY_THRESHOLD) {
+    if (flight.landing_detect_start == 0) {
+      flight.landing_detect_start = now;
+    }
     
+    if (now - flight.landing_detect_start > LANDING_CONFIRM_TIME) {
+      flight.landing_time = now;
+      Serial.println("🎉 LANDED!");
+      log_message("LANDED");
+      print_flight_summary();
+      flush_log();
+      enter_state(LANDED);
+    }
+  } else {
+    flight.landing_detect_start = 0;
+  }
+  break;
     case LANDED:
       {
         static unsigned long last_landed_flush = 0;
