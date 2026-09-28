@@ -754,5 +754,3 @@ The next iteration moves the system from hand-wired prototype hardware to a dedi
 
 ---
 
-## License
-
